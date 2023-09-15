@@ -1,0 +1,419 @@
+substitutions:
+  plug_name: "office_jan"
+  ip_adress: "192.168.178.112"
+  presence_debounce_time: 30min
+  irheat_max_power: "260"
+  pc_on_power: "250"
+  speaker_on_power: "20"
+  display_on_power: "80"
+
+esphome:
+  name: "office_jan"
+  on_boot: 
+    then:
+      - delay: 400ms
+      - switch.turn_on: bs_rel_pc_supply
+
+
+
+esp8266:
+  board: d1_mini
+
+# Enable logging
+logger:
+
+
+debug:
+  update_interval: 5s
+
+
+packages:
+  device_base: !include device_base.yaml      
+
+
+
+i2c:
+  sda: D2
+  scl: D1
+  scan: true
+  id: i2c_a  
+
+sx1509:
+  - id: sx1509_hub1
+    address: 0x3E
+
+dallas:
+  - pin: D4
+    update_interval: 20sec
+
+# ---------------------- user ----------------------------
+
+number:
+  - platform: template
+    name: "Office IR Heizung Obere Grenze"
+    id: heater_max_temp
+    unit_of_measurement: "°C"
+    optimistic: true
+    restore_value: true
+    min_value: 10
+    max_value: 30
+    step: 1
+
+
+  - platform: template
+    name: "Office IR Heizung Untere Grenze"
+    id: heater_min_temp
+    unit_of_measurement: "°C"
+    optimistic: true
+    restore_value: true
+    min_value: 10
+    max_value: 30
+    step: 1
+
+
+
+  - platform: template
+    name: "Office Heizung IR Ansteuerung"
+    id: ir_heat_relative_request
+    optimistic: true
+    entity_category: "diagnostic"
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 1     
+
+
+globals:
+   - id: my_ac_dimmer_power
+     type: float
+     restore_value: no
+     initial_value: '0'
+
+
+# ------------------   Eingänge   --------------------------------
+
+binary_sensor:
+  - platform: gpio
+    id: gpio_presence
+    name: "Office Anwesenheit"
+    device_class: presence  
+    pin: 
+      number: D0
+      mode: INPUT
+    filters:
+      - delayed_off: ${presence_debounce_time}
+    on_press:
+      then:
+        - lambda: if(id(pc_an).state) {id(office_speaker).turn_on();}
+    on_release:
+      then:
+        - switch.turn_off : office_speaker
+
+
+  - platform: gpio
+    id: pc_an
+    name: "Office PC"
+    pin: 
+      number: D5
+      mode: INPUT
+      inverted: true
+    device_class: power
+    filters:
+      - delayed_off: 5000ms
+    on_press:
+      then:
+        - logger.log: 
+            format: "PC an!"
+            level: INFO
+        - switch.turn_on : sw_display
+    on_release:
+      then: 
+        - switch.turn_off : office_speaker
+        - switch.turn_off : sw_display
+        - delay: 50ms
+        - switch.turn_on : sw_display
+        - delay: 50ms
+        - switch.turn_off : sw_display
+        - delay: 50ms
+        - switch.turn_on : sw_display
+        - delay: 50ms
+        - switch.turn_off : sw_display
+
+
+sensor:
+  - platform: template
+    name: "Office Heizung Ansteuerung"
+    id: heater_value
+    icon: "mdi:valve"
+    lambda: |-
+      if (isnan(id(ir_surface_temp).state) || 
+        ((id(heater_max_temp).state - id(heater_min_temp).state) == 0))
+      {
+        ESP_LOGI("main", "Invalid input %f", id(ir_surface_temp).state);
+        return id(heater_value).state;
+
+      } else {
+        float new_val;
+        new_val = (id(heater_max_temp).state - id( office_desk_temp).state ) * 100 /
+                  (id(heater_max_temp).state  - id(heater_min_temp).state );
+        if (new_val > 100) new_val = 100;
+        // nur heizen, wenn PC an und jemand da:
+        if (new_val < 0 || !id(pc_an).state || !id(gpio_presence).state )  new_val = 0;
+        id(dimmer1).set_level(new_val / 100);
+        return new_val;
+
+      }
+    unit_of_measurement: "%"
+    update_interval: 6s
+
+
+
+  - platform: template
+    name: "Office AC Leistung"
+    id: power_ac_sum
+    icon: "mdi:power"
+    lambda: |-
+      float power_sum = 0;
+      if (id(sw_display).state) {
+        power_sum += ${display_on_power};  
+      }
+      if (id(pc_an).state) {
+        power_sum += ${pc_on_power};  
+      }
+      if (id(office_speaker).state) {
+        power_sum += ${speaker_on_power};  
+      }
+      power_sum += id(heater_value).state / 100 * ${irheat_max_power} ;  
+      return power_sum;
+    unit_of_measurement: "W"
+    update_interval: 20s
+
+
+
+  - platform: dallas
+    address: 0xed3c02f649eb1828
+    name: "Office Temperatur Umgebung"
+    id: office_desk_temp_raw
+    filters:    
+      - sliding_window_moving_average:
+          window_size: 4
+          send_every: 2  
+      - or:
+          - delta: 0.2
+          - throttle: 10min
+          
+  - platform: dallas
+    address: 0x203c2af648f5eb28
+    name: "Office Temperatur IR Heizung Oberfläche"
+    id: ir_surface_temp_raw
+    filters:    
+      - sliding_window_moving_average:
+          window_size: 2
+          send_every: 2  
+      - or:
+          - delta: 0.2
+          - throttle: 10min
+
+# debounce sensoren
+  - platform: template
+    name: "Office Heater Surface Temp" 
+    # incl drucker
+    device_class: temperature 
+    id: ir_surface_temp
+    lambda: |-
+
+      if (isnan(id(ir_surface_temp_raw).state)) {
+        if (isnan(id(ir_surface_temp).state)) return 20.4;
+        return id(ir_surface_temp).state;}
+      return id(ir_surface_temp_raw).state;
+    update_interval: 2s 
+    unit_of_measurement: °C
+
+
+  - platform: template
+    name: "Office Desk Temp"  
+    id: office_desk_temp
+    # incl drucker
+    device_class: temperature 
+    lambda: |-
+
+      if (isnan(id(office_desk_temp_raw).state)) {
+        if (isnan(id(office_desk_temp).state)) return 20.4;
+        return id(office_desk_temp).state;}
+      return id(office_desk_temp_raw).state;
+    update_interval: 2s 
+    unit_of_measurement: °C          
+
+# ------------------   Ausgänge   --------------------------------
+
+output:
+  - platform: ac_dimmer
+    id: dimmer1
+    gate_pin: D7
+    zero_cross_pin:
+      number: D6
+      mode:
+        input: true
+    inverted: yes
+
+
+  - platform: template
+    id: ir_heat_output_template
+    type: float
+    write_action:
+
+      - output.set_level:
+          id: dimmer1
+          level: !lambda |-
+              return state;
+      - lambda: id(my_ac_dimmer_power) = state * ${irheat_max_power} ;
+
+switch:
+  - platform: template
+    name: "IT Jan Büro Office Ladegeräte Versorgung"
+    id: bs_rel_2
+    optimistic: true
+    turn_on_action:
+      then:
+        - switch.turn_off: gpio_set_bs_rel1
+        - delay: 20ms
+        - switch.turn_on: gpio_rset_bs_rel1
+        - delay: 100ms
+        - switch.turn_off: gpio_rset_bs_rel1
+    turn_off_action:
+      then:
+        - switch.turn_off: gpio_rset_bs_rel1
+        - delay: 20ms
+        - switch.turn_on: gpio_set_bs_rel1
+        - delay: 100ms
+        - switch.turn_off: gpio_set_bs_rel1
+
+  - platform: template
+    id: bs_rel_pc_supply
+    name: "Office PC Supply"
+    optimistic: true
+    turn_on_action:
+      then:
+        - switch.turn_off: gpio_rset_bs_rel2
+        - delay: 20ms
+        - switch.turn_on: gpio_set_bs_rel2
+        - delay: 100ms
+        - switch.turn_off: gpio_set_bs_rel2
+        
+    turn_off_action:
+      then:
+        - switch.turn_off: gpio_set_bs_rel2
+        - delay: 20ms
+        - switch.turn_on: gpio_rset_bs_rel2
+        - delay: 100ms
+        - switch.turn_off: gpio_rset_bs_rel2
+
+
+  - platform: template
+    name: "Büro Lautsprecher"
+    id: "office_speaker"
+    icon: "mdi:speaker-multiple"
+    optimistic: true
+    turn_on_action:
+      - delay: 200ms
+      - switch.turn_on: sw_speaker1
+      - delay: 200ms
+      - switch.turn_on: sw_speaker2
+    turn_off_action:
+      - delay: 1sec
+      - switch.turn_off: sw_speaker1  
+      - delay: 20ms 
+      - switch.turn_off: sw_speaker2  
+      - delay: 20ms
+      - switch.turn_on: sw_speaker1  
+      - delay: 20ms
+      - switch.turn_on: sw_speaker2  
+      - delay: 20ms
+      - switch.turn_off: sw_speaker1  
+      - delay: 20ms
+      - switch.turn_off: sw_speaker2  
+
+  - platform: gpio
+    name: "Office Jan LS1"
+    id: "sw_speaker1"
+    entity_category: "diagnostic"
+    pin:
+      sx1509: sx1509_hub1
+      # Use pin number A5
+      number: 4
+      # One of INPUT, INPUT_PULLUP or OUTPUT
+      mode:
+        output: true
+  
+  - platform: gpio
+    name: "Office Jan LS2"
+    id: "sw_speaker2"
+    entity_category: "diagnostic"
+    pin:
+      sx1509: sx1509_hub1
+      # Use pin number A4
+      number: 7
+      # One of INPUT, INPUT_PULLUP or OUTPUT
+      mode:
+        output: true
+
+
+  - platform: gpio
+    name: "Wohnzimmer Versorgung Licht 24V"
+    id: "sw_supply_24v"
+    pin:
+      sx1509: sx1509_hub1
+      # Use pin number A5
+      number: 5
+      # One of INPUT, INPUT_PULLUP or OUTPUT
+      mode:
+        output: true
+  
+
+  # geht an /aus mit PC
+  - platform: gpio
+    name: "Office Jan Displays Monitor"
+    id: "sw_display"
+    pin:
+      sx1509: sx1509_hub1
+      # Use pin number A4
+      number: 6
+      # One of INPUT, INPUT_PULLUP or OUTPUT
+      mode:
+        output: true
+
+  - platform: gpio
+    id: "gpio_rset_bs_rel1"
+    pin:
+      sx1509: sx1509_hub1
+      number: 8
+      mode:
+        output: true
+      inverted: false
+  
+  - platform: gpio
+    id: "gpio_set_bs_rel1"
+    pin:
+      sx1509: sx1509_hub1
+      number: 9
+      mode:
+        output: true
+      inverted: false
+
+  - platform: gpio
+    id: "gpio_rset_bs_rel2"
+    pin:
+      sx1509: sx1509_hub1
+      number: 10
+      mode:
+        output: true
+      inverted: false
+  
+  - platform: gpio
+    id: "gpio_set_bs_rel2"
+    pin:
+      sx1509: sx1509_hub1
+      number: 11
+      mode:
+        output: true
+      inverted: false
